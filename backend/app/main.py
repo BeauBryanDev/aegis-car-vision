@@ -1,11 +1,39 @@
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+from app.api.routes import anpr
+from app.ml.pipelines.anpr_service import ANPRService
+
+logger = logging.getLogger("carsrecong")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Load the ONNX models once at startup so the first request doesn't pay the
+    initialization cost and so a missing/broken model fails fast and visibly.
+    """
+    logger.info("Loading ANPR models...")
+    try:
+        app.state.anpr_service = ANPRService()
+        logger.info("ANPR models loaded.")
+    except Exception:
+        # Keep the app up so /api/health still answers; /api/anpr/* will return 503.
+        app.state.anpr_service = None
+        logger.exception("Failed to load ANPR models; ANPR endpoints will return 503.")
+    yield
+    app.state.anpr_service = None
+
 
 # Initialize the FastAPI application with metadata
 app = FastAPI(
     title="CarsTracker API",
     description="Machine Learning backend for ALPR and Vehicle Tracking",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Define allowed origins for Cross-Origin Resource Sharing (CORS)
@@ -37,8 +65,11 @@ def health_check():
         dict: A status dictionary indicating the service is operational.
     """
     return {
-        "status": "active", 
+        "status": "active",
         "service": "carsrecong_api",
         "message": "System is ready for ML inference"
     }
-    
+
+
+# Register API routers
+app.include_router(anpr.router)

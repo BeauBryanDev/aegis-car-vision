@@ -7,13 +7,35 @@ import onnxruntime as ort
 from typing import Tuple
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(os.path.dirname(CURRENT_DIR), "ml_models")
+ML_DIR = os.path.dirname(CURRENT_DIR)
+MODELS_DIR = os.path.join(ML_DIR, "ml_models")
 OCR_MODEL_PATH = os.path.join(MODELS_DIR, "plate_ocr.onnx")
+# Character dictionary the plate_ocr.onnx model was exported with (stock PP-OCRv4 English).
+CHAR_DICT_PATH = os.path.join(ML_DIR, "en_dict.txt")
+
+
+def _load_character_set(dict_path: str) -> list:
+    """
+    Builds the CTC index -> character map that matches the exported model.
+
+    PP-OCRv4 export with use_space_char=True yields a label set of:
+        ['blank'] + <entries in en_dict.txt> + [' ']
+    which is exactly 97 classes for this model (blank + 95 dict entries + 1
+    trailing space). Index 0 is the CTC blank.
+    """
+    with open(dict_path, "r", encoding="utf-8") as f:
+        entries = [line.rstrip("\n").rstrip("\r") for line in f]
+    # Drop a trailing empty line if the file ends with a newline.
+    while entries and entries[-1] == "":
+        entries.pop()
+    return ["blank"] + entries + [" "]
+
 
 class PlateOCRProcessor:
     """
     Handles the execution of the CRNN-based recognition model exported from PaddleOCR.
-    Requires a preprocessed binary/grayscale tensor of the cropped plate.
+    Expects a cropped license-plate image (BGR or grayscale); preprocessing matches
+    the standard PP-OCRv4 recognition pipeline.
     """
     
     def __init__(self, use_gpu: bool = True):
@@ -41,108 +63,103 @@ class PlateOCRProcessor:
         )
         
         self.input_name = self.session.get_inputs()[0].name
-        
-        # Standard PP-OCRv4 English dictionary (96 characters + 1 CTC blank at index 0)
-        # Prevents IndexError when mapping the (Sequence, 97) Softmax tensor output.
-        dict_string = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]_`~ "
-        self.character_set = ['blank'] + list(dict_string)
 
-    def _preprocess_for_crnn(self, processed_crop: np.ndarray) -> np.ndarray:
+        # Load the exact label set the model was exported with (must equal the
+        # model's output class count, here 97).
+        if not os.path.exists(CHAR_DICT_PATH):
+            raise FileNotFoundError(f"Character dictionary not found at {CHAR_DICT_PATH}")
+        self.character_set = _load_character_set(CHAR_DICT_PATH)
+
+        num_classes = self.session.get_outputs()[0].shape[-1]
+        if isinstance(num_classes, int) and num_classes != len(self.character_set):
+            raise ValueError(
+                f"Dictionary size ({len(self.character_set)}) does not match model "
+                f"output classes ({num_classes}). OCR decoding would be misaligned."
+            )
+
+    def _preprocess_for_crnn(self, plate_crop: np.ndarray) -> np.ndarray:
         """
-        Resizes and zero-pads the image to strictly match the static ONNX computational graph 
-        dimensions: [1, 3, 48, 320].
-        
+        Resizes and zero-pads the plate crop to the static ONNX input [1, 3, 48, 320],
+        following the standard PP-OCRv4 recognition preprocessing:
+        keep aspect ratio at a fixed height of 48, normalize to [-1, 1], then
+        right-pad the width to 320.
+
         Args:
-            processed_crop (np.ndarray): Image processed by CLAHE and thresholding.
-            
+            plate_crop (np.ndarray): The cropped license plate (BGR or grayscale).
+
         Returns:
-            np.ndarray: NCHW tensor ready for inference.
+            np.ndarray: NCHW float32 tensor ready for inference.
         """
-        
         target_height = 48
         target_width = 320
-        h, w = processed_crop.shape[:2]
-        
-        # Calculate resize ratio keeping the mathematical aspect ratio intact
+
+        # Ensure a 3-channel image (PP-OCRv4 expects 3 channels).
+        if plate_crop.ndim == 2:
+            plate_crop = cv2.cvtColor(plate_crop, cv2.COLOR_GRAY2BGR)
+
+        h, w = plate_crop.shape[:2]
+
+        # Resize keeping aspect ratio, clipping the width to the static tensor size.
         ratio = w / float(h)
-        resized_w = int(target_height * ratio)
-        
-        # Clip the width mathematically to not exceed our static tensor size
-        if resized_w > target_width:
-            resized_w = target_width
-            
-        resized = cv2.resize(processed_crop, (resized_w, target_height), interpolation=cv2.INTER_AREA)
-        
-        # PP-OCRv4 expects a 3-channel tensor, so we convert the binary/gray image to BGR
-        resized = np.repeat(resized[:, :, np.newaxis], 3, axis=2)
+        resized_w = min(int(target_height * ratio), target_width)
+        resized_w = max(resized_w, 1)
+        resized = cv2.resize(plate_crop, (resized_w, target_height), interpolation=cv2.INTER_LINEAR)
 
-            
-        # Create a black mathematical canvas (zero-padding) of exactly 48x320
-        canvas = np.zeros((target_height, target_width, 3), dtype=np.float32)
-        
-        # Paste the resized plate into the left side of the canvas
-        canvas[:, :resized_w, :] = resized
-        
-        self.canvas = np.zeros((48,320,3), dtype=np.float32)
-        canvas = self.canvas
-        canvas[:] = 0
+        # Normalize to [-1, 1] (PP-OCR: img/255, then (x - 0.5) / 0.5) in CHW order.
+        resized = resized.astype(np.float32).transpose(2, 0, 1) / 255.0
+        resized = (resized - 0.5) / 0.5
 
-        
-        # Normalize to [0, 1] and transpose to NCHW format
-        #tensor = canvas / 255.0
-        
-        tensor = canvas.astype(np.float32) * (1.0 / 255.0)
+        # Zero-pad the normalized image on the right up to the static width.
+        canvas = np.zeros((3, target_height, target_width), dtype=np.float32)
+        canvas[:, :, :resized_w] = resized
 
-        
-        tensor = np.transpose(tensor, (2, 0, 1))
-        tensor = np.expand_dims(tensor, axis=0)
-        
-        return tensor
-        
-        
+        return np.expand_dims(canvas, axis=0)
+
 
     def _ctc_decode(self, predictions: np.ndarray) -> Tuple[str, float]:
         """
-        Decodes the raw Softmax probabilities using CTC Greedy Decoding.
-        Applies Regex filtering to guarantee only alphanumeric characters.
-        
+        Decodes the raw Softmax probabilities using CTC Greedy Decoding:
+        per timestep take the argmax, collapse consecutive duplicates, and drop
+        the blank token (index 0). The collapsed string is then matched against
+        the Colombian plate format; if no match is found the cleaned alphanumeric
+        string is returned as a fallback.
+
         Args:
-            predictions (np.ndarray): The raw output tensor from the CRNN.
-            
+            predictions (np.ndarray): The raw output tensor from the CRNN, shape
+                (batch, timesteps, num_classes).
+
         Returns:
-            Tuple[str, float]: The filtered decoded text and its average confidence score.
+            Tuple[str, float]: The decoded plate text and its average confidence.
         """
-        sequence = predictions[0] 
-        
+        sequence = predictions[0]
+
         raw_text = []
         confidences = []
         previous_idx = 0
-        
+
         for step in sequence:
             char_idx = int(np.argmax(step))
             confidence = float(np.max(step))
-            
+
+            # CTC: skip blanks (index 0) and collapse repeated indices.
             if char_idx != 0 and char_idx != previous_idx:
                 raw_text.append(self.character_set[char_idx])
                 confidences.append(confidence)
-                
+
             previous_idx = char_idx
-            
-        unfiltered_string = "".join(raw_text)
-        
-        plate_pattern = r'[A-Z]{3}[0-9]{2,3}[A-Z]?'
-        filtered_string = re.sub(plate_pattern, '', unfiltered_string.upper())
-        
-        if char_idx < len(self.character_set):
-            raw_text.append(self.character_set[char_idx])
-            confidences.append(confidence)
-            
-        # Enforce Colombian plate domain math (A-Z, 0-9)
-        # filtered_string = re.sub(r'[^A-Z0-9]', '', unfiltered_string.upper())
-        
+
+        decoded = "".join(raw_text).upper()
+
+        # Keep only plate-valid characters (Colombian plates are A-Z, 0-9).
+        cleaned = re.sub(r"[^A-Z0-9]", "", decoded)
+
+        # Prefer a strict Colombian plate match (e.g. ABC123 / ABC12D) if present.
+        match = re.search(r"[A-Z]{3}[0-9]{2,3}[A-Z]?", cleaned)
+        plate_text = match.group(0) if match else cleaned
+
         avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-        
-        return filtered_string, avg_confidence
+
+        return plate_text, avg_confidence
 
 
     def extract_text(self, processed_crop: np.ndarray) -> Tuple[str, float]:
@@ -159,21 +176,11 @@ class PlateOCRProcessor:
 
         outputs = self.session.run(None, {self.input_name: tensor})
         raw_probabilities = outputs[0]
-        
-        raw_probabilities = outputs[0]
 
         if raw_probabilities.ndim == 4:
-            # Remove extra channel dimension if present
-            raw_probabilities = raw_probabilities[:,0,:,:]
-
-        elif raw_probabilities.ndim == 3:
-            # No channel dimension present
-            pass
-
-        else:
+            # Collapse an extra channel dimension if the export carries one.
+            raw_probabilities = raw_probabilities[:, 0, :, :]
+        elif raw_probabilities.ndim != 3:
             raise ValueError(f"Unexpected OCR output shape: {raw_probabilities.shape}")
 
-
-        # Remove extra channel dimension if present
-         
         return self._ctc_decode(raw_probabilities)

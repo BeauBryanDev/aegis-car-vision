@@ -224,4 +224,8 @@ cars
 # Ingore all .onnx ml models
 *.onnx
 
+# Ignroe all debugging dirs
+
+backend/debug_out/
+
 

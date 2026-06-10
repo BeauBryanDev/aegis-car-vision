@@ -42,32 +42,38 @@ def preprocess_for_ocr(cropped_plate: np.ndarray) -> np.ndarray:
     return binary
 
 
-def extract_plate_crop(frame: np.ndarray, bbox: list[int], padding: float = 0.12) -> np.ndarray:
+def extract_plate_crop(frame: np.ndarray, bbox: list[int], padding: float = 0.12, return_offset: bool = False):
     """
     Safely extracts the bounding box region from the main video frame.
-    
+
     Args:
         frame (np.ndarray): The full video frame.
         bbox (list[int]): Bounding box coordinates in format [x_min, y_min, x_max, y_max].
         padding (float): Relative padding to add around the crop (default is 12%).
-        
+        return_offset (bool): If True, also return the (x_min, y_min) origin of the crop
+            within ``frame`` so coordinates can be mapped back to the original image.
+
     Returns:
-        np.ndarray: The cropped image tensor.
+        np.ndarray: The cropped image tensor. If ``return_offset`` is True, returns a
+            tuple ``(crop, (x_min, y_min))`` instead.
     """
     x_min, y_min, x_max, y_max = [int(coord) for coord in bbox]
-    
+
     # [BUG FIX] Extract spatial dimensions (Height, Width) from the frame tensor
     height, width = frame.shape[:2]
-    
+
     # Calculate dynamic padding based on the bounding box dimensions
     pad_x = int((x_max - x_min) * padding)
     pad_y = int((y_max - y_min) * padding)
-    
+
     # Apply padding while ensuring coordinates do not fall out of the frame boundaries
     x_min = max(0, x_min - pad_x)
     y_min = max(0, y_min - pad_y)
     x_max = min(width, x_max + pad_x)
     y_max = min(height, y_max + pad_y)
-    
+
     # Slice the numpy array with the expanded coordinates
-    return frame[y_min:y_max, x_min:x_max]
+    crop = frame[y_min:y_max, x_min:x_max]
+    if return_offset:
+        return crop, (x_min, y_min)
+    return crop

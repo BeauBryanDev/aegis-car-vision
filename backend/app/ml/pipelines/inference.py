@@ -71,10 +71,14 @@ class VehicleDetectionPipeline:
         Returns:
             Tuple[np.ndarray, float]: The NCHW formatted tensor and the scale factor used.
         """
+        # YOLO models exported from Ultralytics are trained on RGB; OpenCV loads BGR.
+        # Convert so the channel order matches what the model expects.
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
         # Calculate scale to maintain aspect ratio while fitting into target_size
         h, w = img.shape[:2]
         scale = target_size / max(h, w)
-        
+
         # Resize image
         img_resized = cv2.resize(img, (int(w * scale), int(h * scale)))
         # Carefull with original image size, it can be bigger than target_size, so we need to scale it down to fit into the model's expected input size while maintaining aspect ratio.
@@ -103,49 +107,88 @@ class VehicleDetectionPipeline:
         Returns:
             List[Dict[str, Any]]: List of detected vehicles with bounding boxes and classes.
         """
-        tensor, scale = self._preprocess_image(frame, target_size=640)
-        
+        # The vehicle ONNX graph has a static [1, 3, 320, 320] input.
+        tensor, scale = self._preprocess_image(frame, target_size=320)
+
         # Execute the computational graph on the GPU/CPU
         outputs = self.session_vehicle.run(None, {self.input_name_vehicle: tensor})
-        predictions = outputs[0]  # Shape: (1, 4 + classes, 8400)
-        
-        # Transpose to (1, 8400, 4 + classes) for easier parsing
+        predictions = outputs[0]  # Shape: (1, 4 + classes, 2100)
+
+        # Transpose to (2100, 4 + classes) for easier per-anchor parsing
         predictions = np.squeeze(predictions).transpose()
-        
+
         detections = []
-        boxes = []
+        boxes_xyxy = []   # kept for cropping / output
+        boxes_xywh = []   # required format for cv2.dnn.NMSBoxes
         scores = []
         class_ids = []
-        
+
         # Parse the raw tensor
         for row in predictions:
             class_scores = row[4:]
-            class_id = np.argmax(class_scores)
-            max_score = class_scores[class_id]
-            
+            class_id = int(np.argmax(class_scores))
+            max_score = float(class_scores[class_id])
+
             if max_score >= conf_threshold and class_id in self.class_map:
-                # Extract center x, center y, width, height
+                # Extract center x, center y, width, height (in 320px input space)
                 xc, yc, w, h = row[0], row[1], row[2], row[3]
-                
+
                 # Convert to x_min, y_min, x_max, y_max and reverse the scaling
                 x_min = int((xc - w / 2) / scale)
                 y_min = int((yc - h / 2) / scale)
                 x_max = int((xc + w / 2) / scale)
                 y_max = int((yc + h / 2) / scale)
-                
-                boxes.append([x_min, y_min, x_max, y_max])
-                scores.append(float(max_score))
+
+                boxes_xyxy.append([x_min, y_min, x_max, y_max])
+                boxes_xywh.append([x_min, y_min, x_max - x_min, y_max - y_min])
+                scores.append(max_score)
                 class_ids.append(class_id)
-                
-        # Apply OpenCV's built-in NMS to filter overlapping boxes (IoU logic)
-        indices = cv2.dnn.NMSBoxes(boxes, scores, conf_threshold, nms_threshold=0.45)
-        # Avoid Overlapping Boxes (NMS) by filtering out overlapping boxes
+
+        # Apply OpenCV's built-in NMS to filter overlapping boxes (IoU logic).
+        # NMSBoxes interprets boxes as [x, y, w, h], so we pass the xywh form.
+        indices = cv2.dnn.NMSBoxes(boxes_xywh, scores, conf_threshold, nms_threshold=0.45)
         if len(indices) > 0:
             for i in indices.flatten():
                 detections.append({
-                    "bbox": boxes[i],
+                    "bbox": boxes_xyxy[i],
                     "score": scores[i],
                     "class": self.class_map[class_ids[i]]
                 })
-                
+
         return detections
+
+    def detect_plate(self, vehicle_crop: np.ndarray, conf_threshold: float = 0.45) -> Tuple[Any, float]:
+        """
+        Runs the secondary plate detector on a cropped vehicle image and returns the
+        single highest-confidence plate box.
+
+        Args:
+            vehicle_crop (np.ndarray): BGR crop of one detected vehicle.
+            conf_threshold (float): Minimum confidence to accept a plate.
+
+        Returns:
+            Tuple[Optional[List[int]], float]: ([x_min, y_min, x_max, y_max], conf) in
+                the vehicle-crop coordinate space, or (None, 0.0) if no plate is found.
+        """
+        # The plate ONNX graph shares the static [1, 3, 320, 320] input.
+        tensor, scale = self._preprocess_image(vehicle_crop, target_size=320)
+        outputs = self.session_plate.run(None, {self.input_name_plate: tensor})
+
+        # Output shape (1, 5, 2100) -> (2100, 5): [xc, yc, w, h, plate_conf]
+        predictions = np.squeeze(outputs[0]).transpose()
+
+        best_box = None
+        best_conf = 0.0
+        for row in predictions:
+            conf = float(row[4])
+            if conf >= conf_threshold and conf > best_conf:
+                best_conf = conf
+                xc, yc, w, h = row[0], row[1], row[2], row[3]
+                best_box = [
+                    int((xc - w / 2) / scale),
+                    int((yc - h / 2) / scale),
+                    int((xc + w / 2) / scale),
+                    int((yc + h / 2) / scale),
+                ]
+
+        return best_box, best_conf
